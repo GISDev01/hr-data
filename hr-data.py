@@ -54,6 +54,7 @@ config = get_config()
 
 oura = OuraClient(personal_access_token=config['oura_token'])
 
-oura.user_info()
-oura.sleep_summary(start='2021-11-01', end='2021-11-30')
-oura.activity_summary(start='2021-11-20')
+logger.info(oura.user_info())
+logger.info(oura.sleep_summary(start='2021-11-01', end='2021-11-30'))
+logger.info(oura.activity_summary(start='2021-11-20'))
+logger.info(oura.readiness_summary(start='2021-11-20', end='2021-11-30'))
