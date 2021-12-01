@@ -1,17 +1,18 @@
 from oura import OuraClient
 import json
 import os
-from datetime import datetime
+import datetime
+import dateutil.parser
+from pytz import timezone
 
-import logging
-import os.path
 import sys
-
+import logging
 from logging import handlers
 
 import yaml
 
-# config.yml should exist in the same directory as this file
+from psycopg2 import sql, connect
+
 if not os.path.isfile(os.path.join('config', 'config.yml')):
     print('config.yml was not found. You probably need to rename the config.yml.template to config.yml ' +
           'and insert your credentials in this config file')
@@ -54,7 +55,90 @@ config = get_config()
 
 oura = OuraClient(personal_access_token=config['oura_token'])
 
-logger.info(oura.user_info())
-logger.info(oura.sleep_summary(start='2021-11-01', end='2021-11-30'))
-logger.info(oura.activity_summary(start='2021-11-20'))
-logger.info(oura.readiness_summary(start='2021-11-20', end='2021-11-30'))
+OURA_ACTIVITY_TABLE_NAME = "oura_activity"
+OURA_READINESS_TABLE_NAME = "oura_readiness"
+OURA_SLEEP_TABLE_NAME = "oura_sleep"
+
+# Connect once at the beginning of running the script
+PG_CONN = connect(
+    user=config['DB_USER'],
+    password=config['DB_PASSWORD'],
+    host=config['DB_HOST'],
+    port=config['DB_PORT'],
+    database=config['DB_DATABASE'])
+
+
+def get_activity():
+    activity_list = oura.activity_summary(start='2021-11-28', end='2021-11-30')["activity"]
+    for activity in update_activity_data(activity_list):
+        logger.info(json.dumps(activity,
+                               sort_keys=True, indent=4))
+
+
+def get_oura_sleep_and_store_in_pg():
+    sleep_list = oura.sleep_summary()["sleep"]
+    for sleep in update_sleep_data(sleep_list):
+        write_row_to_pg(OURA_SLEEP_TABLE_NAME, sleep)
+
+
+def get_readiness():
+    readiness_list = oura.readiness_summary(start='2021-11-28', end='2021-11-30')["readiness"]
+    for readiness in readiness_list:
+        logger.info(json.dumps(readiness,
+                               sort_keys=True, indent=4))
+
+
+def update_sleep_data(sleep_data):
+    for row in sleep_data:
+        row['summary_date'] = dateutil.parser.parse(row['summary_date']).date()
+        row['bedtime_start'] = dateutil.parser.parse(row['bedtime_start']).astimezone(timezone(config["TIMEZONE"]))
+        row['bedtime_end'] = dateutil.parser.parse(row['bedtime_end']).astimezone(timezone(config["TIMEZONE"]))
+
+        # map the hypnogram data to a more readable format
+        # 'D' = deep sleep
+        # 'L' = light sleep
+        # 'R' = REM sleep
+        # 'A' = awake
+        row['hypnogram_5min'] = ['DLRA'[int(c) - 1] for c in row['hypnogram_5min']]
+        row['is_longest'] = bool(row['is_longest'])
+
+    return sleep_data
+
+
+def update_activity_data(activity_data):
+    for row in activity_data:
+        row['day_start'] = dateutil.parser.parse(row['day_start'])
+        row['day_end'] = dateutil.parser.parse(row['day_end'])
+        row['summary_date'] = dateutil.parser.parse(row['summary_date']).date()
+        row['class_5min'] = list(map(int, row['class_5min']))
+
+    return activity_data
+
+
+def get_yesterday_iso_date():
+    yesterday = datetime.datetime.now().date() - datetime.timedelta(days=1)
+    return yesterday.isoformat()
+
+
+def write_row_to_pg(table, row):
+    cursor = PG_CONN.cursor()
+
+    # TODO: Replace with ORM
+    keys = sorted(row.keys())
+    values = [row[k] for k in keys]
+    key_count = len(keys)
+    keys_template = ', '.join(['{}' for _ in range(key_count)])
+    vals_template = ', '.join(['%s' for _ in range(key_count)])
+    sql_ids = [sql.Identifier(table)] + [sql.Identifier(k) for k in keys]
+    raw_sql = sql.SQL(f'INSERT INTO {{}} ({keys_template}) VALUES ({vals_template})').format(*sql_ids)
+
+    try:
+        cursor.execute(raw_sql, values)
+        PG_CONN.commit()
+    except Exception as e:
+        logger.exception("Unable to insert row into PG: ", e)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    get_oura_sleep_and_store_in_pg()
